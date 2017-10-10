@@ -32,12 +32,15 @@ type RequestAuthToken struct {
 // multipart/form-data or application/x-www-urlencoded parameters
 func (h *RequestAuthToken) Handle(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
 	create := r.Method == "POST"
-	email := r.PostFormValue("email")
-	tType := r.PostFormValue("type")
-	redirect := r.PostFormValue("redirect")
-	if tType == "" {
+
+	var tType string
+	if tType = r.PostFormValue("type"); tType == "" {
 		tType = "api"
 	}
+	email := r.PostFormValue("email")
+	redirect := r.PostFormValue("redirect")
+	preauth := auth != nil && auth.Type == "api" && auth.Email == email // Client is already authenticated
+	device := DeviceFromRequest(r)
 
 	// Make sure email field is set
 	if email == "" {
@@ -74,7 +77,7 @@ func (h *RequestAuthToken) Handle(w http.ResponseWriter, r *http.Request, auth *
 		}
 	}
 
-	authRequest, err := NewAuthRequest(email, tType)
+	authRequest, err := NewAuthRequest(email, tType, device)
 	if err != nil {
 		return err
 	}
@@ -91,19 +94,29 @@ func (h *RequestAuthToken) Handle(w http.ResponseWriter, r *http.Request, auth *
 	var emailBody bytes.Buffer
 	var emailSubj string
 
-	switch tType {
-	case "api":
-		if response, err = json.Marshal(map[string]string{
+	actLink := fmt.Sprintf("%s/activate/?t=%s", h.BaseUrl(r), authRequest.Token)
+
+	// Compose response
+	if tType == "api" || preauth {
+		res := map[string]string{
 			"id":    authRequest.AuthToken.Id,
 			"token": authRequest.AuthToken.Token,
 			"email": authRequest.AuthToken.Email,
-		}); err != nil {
+		}
+
+		// If the client is already preauthenticated, we can send the activation
+		// link back directly with the response
+		if preauth || h.Config.Test {
+			res["actUrl"] = actLink
+		}
+
+		if response, err = json.Marshal(res); err != nil {
 			return err
 		}
 		emailSubj = "Connect to Padlock Cloud"
 
 		w.Header().Set("Content-Type", "application/json")
-	case "web":
+	} else {
 		var buff bytes.Buffer
 		if err := h.Templates.LoginPage.Execute(&buff, map[string]interface{}{
 			"submitted": true,
@@ -118,30 +131,26 @@ func (h *RequestAuthToken) Handle(w http.ResponseWriter, r *http.Request, auth *
 		w.Header().Set("Content-Type", "text/html")
 	}
 
-	actLink := fmt.Sprintf("%s/activate/?t=%s", h.BaseUrl(r), authRequest.Token)
-	// Render activation email
-	if err := h.Templates.ActivateAuthTokenEmail.Execute(&emailBody, map[string]interface{}{
-		"activation_link": actLink,
-		"token":           authRequest.AuthToken,
-	}); err != nil {
-		return err
-	}
+	// No need to send and activation email if the client is preauthorized
+	if !preauth {
+		if h.emailRateLimiter.RateLimit(getIp(r), email) {
+			return &RateLimitExceeded{}
+		}
 
-	if !h.emailRateLimiter.RateLimit(getIp(r), email) {
+		// Render activation email
+		if err := h.Templates.ActivateAuthTokenEmail.Execute(&emailBody, map[string]interface{}{
+			"activation_link": actLink,
+			"token":           authRequest.AuthToken,
+		}); err != nil {
+			return err
+		}
+
 		// Send email with activation link
 		go func() {
 			if err := h.Sender.Send(email, emailSubj, emailBody.String()); err != nil {
 				h.LogError(&ServerError{err}, r)
 			}
 		}()
-	} else {
-		return &RateLimitExceeded{}
-	}
-
-	// When in test mode, return activation link directly with request so the client can continue
-	// with the authentication flow directly
-	if h.Config.Test {
-		w.Header().Set("X-Test-Act-Url", actLink)
 	}
 
 	h.Info.Printf("%s - auth_token:request - %s:%s:%s\n", FormatRequest(r), email, tType, authRequest.AuthToken.Id)
@@ -189,6 +198,20 @@ func (h *ActivateAuthToken) Activate(authRequest *AuthRequest) error {
 		return err
 	}
 
+	// Revoke existing tokens with the same device UUID
+	if at.Device != nil && at.Device.UUID != "" {
+		t := &AuthToken{
+			Type: at.Type,
+			Device: &Device{
+				UUID: at.Device.UUID,
+			},
+		}
+
+		// Do this until no more tokens with the same UUID are found
+		for acc.RemoveAuthToken(t) {
+		}
+	}
+
 	// Add the new key to the account
 	acc.AddAuthToken(at)
 
@@ -229,7 +252,7 @@ func (h *ActivateAuthToken) Success(w http.ResponseWriter, r *http.Request, auth
 
 	if at.Type == "api" {
 		// If auth type is "api" also log them in so they can be redirected to dashboard
-		login, err := NewAuthRequest(at.Email, "web")
+		login, err := NewAuthRequest(at.Email, "web", at.Device)
 		if err != nil {
 			return err
 		}
@@ -335,58 +358,6 @@ func (h *DeleteStore) Handle(w http.ResponseWriter, r *http.Request, auth *AuthT
 	return nil
 }
 
-type RequestDeleteStore struct {
-	*Server
-}
-
-// Handler function for requesting a data reset for a given account
-func (h *RequestDeleteStore) Handle(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
-	acc := auth.Account()
-
-	// Create AuthRequest
-	authRequest, err := NewAuthRequest(acc.Email, "web")
-	if err != nil {
-		return err
-	}
-
-	// After logging in, redirect to delete store page
-	authRequest.Redirect = "/dashboard/?action=resetdata"
-
-	// Save authrequest
-	if err := h.Storage.Put(authRequest); err != nil {
-		return err
-	}
-
-	// Render confirmation email
-	var buff bytes.Buffer
-	if err := h.Templates.ActivateAuthTokenEmail.Execute(&buff, map[string]interface{}{
-		"token":           authRequest.AuthToken,
-		"activation_link": fmt.Sprintf("%s/activate/?t=%s", h.BaseUrl(r), authRequest.Token),
-	}); err != nil {
-		return err
-	}
-
-	body := buff.String()
-
-	if !h.emailRateLimiter.RateLimit(getIp(r), acc.Email) {
-		// Send email with activation link
-		go func() {
-			if err := h.Sender.Send(acc.Email, "Padlock Cloud Delete Request", body); err != nil {
-				h.LogError(&ServerError{err}, r)
-			}
-		}()
-	} else {
-		return &RateLimitExceeded{}
-	}
-
-	h.Info.Printf("%s - data_store:request_delete - %s", FormatRequest(r), acc.Email)
-
-	// Send ACCEPTED status code
-	w.WriteHeader(http.StatusAccepted)
-
-	return nil
-}
-
 type LoginPage struct {
 	*Server
 }
@@ -406,21 +377,35 @@ type Dashboard struct {
 	*Server
 }
 
-func (h *Dashboard) Handle(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
+func DashboardParams(r *http.Request, auth *AuthToken) map[string]interface{} {
 	acc := auth.Account()
 
-	var b bytes.Buffer
-	if err := h.Templates.Dashboard.Execute(&b, map[string]interface{}{
+	var pairedToken *AuthToken
+	if paired := r.URL.Query().Get("paired"); paired != "" {
+		_, pairedToken = acc.findAuthToken(&AuthToken{Id: paired})
+	}
+
+	var revokedToken *AuthToken
+	if revoked := r.URL.Query().Get("revoked"); revoked != "" {
+		_, revokedToken = acc.findAuthToken(&AuthToken{Id: revoked})
+	}
+
+	return map[string]interface{}{
+		"auth":          auth,
 		"account":       acc,
-		"paired":        r.URL.Query().Get("paired"),
-		"revoked":       r.URL.Query().Get("revoked"),
+		"paired":        pairedToken,
+		"revoked":       revokedToken,
 		"datareset":     r.URL.Query().Get("datareset"),
 		"action":        r.URL.Query().Get("action"),
 		CSRFTemplateTag: CSRFTemplateField(r),
-	}); err != nil {
+	}
+}
+
+func (h *Dashboard) Handle(w http.ResponseWriter, r *http.Request, auth *AuthToken) error {
+	var b bytes.Buffer
+	if err := h.Templates.Dashboard.Execute(&b, DashboardParams(r, auth)); err != nil {
 		return err
 	}
-
 	b.WriteTo(w)
 	return nil
 }
